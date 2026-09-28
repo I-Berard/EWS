@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy
+alembic
+psycopg2-binary
+geoalchemy2
+pydantic
+pydantic-settings
+celery
+redis
+requests
+rasterio
+geopandas
+shapely
+scipy
+numpy
