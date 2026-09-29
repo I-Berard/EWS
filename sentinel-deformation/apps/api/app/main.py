@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .api import aoi
+from .api import aoi, demo
 
 app = FastAPI(
     title="Sentinel Deformation Monitor",
@@ -21,4 +21,14 @@ app.add_middleware(
 def health_check():
     return {"status": "ok", "service": "Sentinel Deformation Monitor API"}
 
+
+@app.get("/")
+def root():
+    return {
+        "name": "Sentinel Deformation Monitor API",
+        "docs": "/docs",
+        "endpoints": ["/health", "/api/aois", "/api/demo/aois"],
+    }
+
 app.include_router(aoi.router, prefix="/api/aois", tags=["aois"])
+app.include_router(demo.router, prefix="/api/demo", tags=["demo"])

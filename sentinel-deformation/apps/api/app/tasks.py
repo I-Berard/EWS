@@ -1,11 +1,19 @@
 import os
+import sys
+from pathlib import Path
 from celery import Celery
-from ...processing.catalog.search import search_sentinel1
-from ...processing.catalog.download import download_product
-from ...processing.insar.prepare import preprocess_sentinel1_intensity
-from ...processing.timeseries.run import process_time_series_stack
 from typing import List
 from .config import settings
+
+# Make the top-level `processing` package importable when the API runs from apps/api
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from processing.catalog.search import search_sentinel1  # noqa: E402
+from processing.catalog.download import download_product  # noqa: E402
+from processing.insar.prepare import preprocess_sentinel1_intensity  # noqa: E402
+from processing.timeseries.run import process_time_series_stack  # noqa: E402
 
 # Initialize Celery
 celery_app = Celery(

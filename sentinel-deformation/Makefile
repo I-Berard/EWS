@@ -1,4 +1,4 @@
-.PHONY: up down db-shell redis-shell minio-shell frontend api
+.PHONY: up down db-shell redis-shell minio-shell frontend api test test-api test-web
 
 up:
 	docker-compose up -d
@@ -17,3 +17,11 @@ api:
 
 frontend:
 	cd apps/web && npm run dev
+
+test: test-api test-web
+
+test-api:
+	cd apps/api && ../../venv/bin/python -m pytest tests/ -v
+
+test-web:
+	cd apps/web && npx vitest run
