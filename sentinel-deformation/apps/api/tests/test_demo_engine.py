@@ -8,6 +8,7 @@ determinism - all pure stdlib, no heavy geo dependencies required.
 
 import struct
 import zlib
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -221,3 +222,211 @@ class TestSummaryAndProduct:
         assert meta["width"] == engine.GRID_W
         assert meta["height"] == engine.GRID_H
         assert meta["acquisition"]["start"] < meta["acquisition"]["end"]
+
+
+# ---------------------------------------------------------------------------
+# Sentinel-1 acquisition schedule
+# ---------------------------------------------------------------------------
+
+class TestAcquisitions:
+    def test_schedule_shape(self):
+        acq = engine.get_acquisitions(AOI_ID)
+        assert len(acq) == engine.N_ACQUISITIONS
+        assert [a["index"] for a in acq] == list(range(engine.N_ACQUISITIONS))
+        assert len({a["id"] for a in acq}) == len(acq)
+        for a in acq:
+            datetime.strptime(a["date"], "%Y-%m-%d")  # ISO format
+
+    def test_dates_sorted_with_12_day_revisit(self):
+        dates = [a["date"] for a in engine.get_acquisitions(AOI_ID)]
+        assert dates == sorted(dates)
+        parsed = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
+        deltas = [(b - a).days for a, b in zip(parsed, parsed[1:])]
+        assert deltas == [engine.ACQUISITION_CYCLE_DAYS] * len(deltas)
+
+    def test_deterministic(self):
+        assert engine.get_acquisitions(AOI_ID) == engine.get_acquisitions(AOI_ID)
+
+    def test_product_window_matches_schedule(self):
+        aoi = {
+            "id": AOI_ID,
+            "geometry": {"type": "Polygon",
+                         "coordinates": [[[29.9, -2.0], [30.2, -2.0], [30.2, -1.8], [29.9, -1.8], [29.9, -2.0]]]},
+        }
+        meta = engine.get_product_meta(aoi)
+        acq = engine.get_acquisitions(AOI_ID)
+        assert meta["acquisition"]["start"] == acq[0]["date"]
+        assert meta["acquisition"]["end"] == acq[-1]["date"]
+
+
+class TestSelectAcquisitions:
+    def test_defaults_to_full_mission(self):
+        selected, start, end = engine.select_acquisitions(AOI_ID)
+        assert len(selected) == engine.N_ACQUISITIONS
+        assert start == selected[0]["date"]
+        assert end == selected[-1]["date"]
+
+    def test_filters_by_period(self):
+        selected, start, end = engine.select_acquisitions(AOI_ID, "2026-01-01", "2026-03-31")
+        assert start == "2026-01-01" and end == "2026-03-31"
+        assert len(selected) >= 2
+        assert all("2026-01-01" <= a["date"] <= "2026-03-31" for a in selected)
+
+    def test_requires_two_visits(self):
+        with pytest.raises(ValueError, match="at least 2"):
+            engine.select_acquisitions(AOI_ID, "2026-09-01", "2026-09-01")
+
+    def test_rejects_inverted_period(self):
+        with pytest.raises(ValueError, match="after period end"):
+            engine.select_acquisitions(AOI_ID, "2026-09-01", "2026-01-01")
+
+    def test_rejects_bad_date_format(self):
+        with pytest.raises(ValueError, match="YYYY-MM-DD"):
+            engine.select_acquisitions(AOI_ID, "01/01/2026", "2026-06-01")
+
+
+# ---------------------------------------------------------------------------
+# Period movement analysis (stack overlay)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def movement_analysis():
+    return engine.get_movement_analysis(BBOX, AOI_ID)
+
+
+def _strip_timestamps(result):
+    """detected_at is wall-clock time, so it is excluded from equality checks."""
+    for feature in result["areas"]["features"]:
+        feature["properties"].pop("detected_at", None)
+    return result
+
+
+class TestMovementAnalysis:
+    def test_schema(self, movement_analysis):
+        result = movement_analysis
+        assert result["aoi_id"] == AOI_ID
+        assert result["unit"] == "mm (LOS)"
+        for key in ("period", "n_acquisitions", "acquisitions", "threshold_mm", "stats", "areas"):
+            assert key in result
+        assert result["period"]["start"] <= result["period"]["end"]
+        assert result["period"]["days"] >= 0
+        assert result["n_acquisitions"] >= 2
+        assert result["n_acquisitions"] == len(result["acquisitions"])
+        stats = result["stats"]
+        for key in ("max_movement_mm", "max_movement_magnitude_mm", "peak_velocity_mm_yr",
+                    "peak_location", "n_areas", "total_area_m2"):
+            assert key in stats
+        assert stats["max_movement_magnitude_mm"] == abs(stats["max_movement_mm"])
+
+    def test_uses_only_visits_inside_period(self, movement_analysis):
+        for acq in movement_analysis["acquisitions"]:
+            assert movement_analysis["period"]["start"] <= acq["date"] <= movement_analysis["period"]["end"]
+
+    def test_peak_location_inside_bbox(self, movement_analysis):
+        loc = movement_analysis["stats"]["peak_location"]
+        west, south, east, north = BBOX
+        assert west <= loc["lng"] <= east
+        assert south <= loc["lat"] <= north
+
+    def test_deterministic(self):
+        a = engine.get_movement_analysis(BBOX, AOI_ID, "2026-01-01", "2026-06-01")
+        b = engine.get_movement_analysis(BBOX, AOI_ID, "2026-01-01", "2026-06-01")
+        assert _strip_timestamps(a) == _strip_timestamps(b)
+
+    def test_areas_ranked_by_peak_movement(self, movement_analysis):
+        features = movement_analysis["areas"]["features"]
+        assert movement_analysis["stats"]["n_areas"] == len(features)
+        peaks = [abs(f["properties"]["peak_movement_mm"]) for f in features]
+        assert peaks == sorted(peaks, reverse=True)
+        assert [f["properties"]["rank"] for f in features] == list(range(1, len(features) + 1))
+        # Every detected area cleared the period threshold
+        for f in features:
+            assert abs(f["properties"]["peak_movement_mm"]) >= movement_analysis["threshold_mm"] - 0.02
+
+    def test_area_feature_schema(self, movement_analysis):
+        for f in movement_analysis["areas"]["features"]:
+            assert f["type"] == "Feature"
+            assert f["geometry"]["type"] == "Polygon"
+            ring = f["geometry"]["coordinates"][0]
+            assert len(ring) >= 4
+            assert ring[0] == ring[-1]
+            for lon, lat in ring:
+                assert BBOX[0] - 0.01 <= lon <= BBOX[2] + 0.01
+                assert BBOX[1] - 0.01 <= lat <= BBOX[3] + 0.01
+            p = f["properties"]
+            for key in ("id", "aoi_id", "event_type", "period_start", "period_end",
+                        "n_acquisitions", "area_m2", "mean_movement_mm", "peak_movement_mm",
+                        "mean_velocity_mm_yr", "coherence", "confidence", "pixel_count",
+                        "rank", "detected_at"):
+                assert key in p
+            assert p["event_type"] in ("subsidence", "uplift")
+            assert p["period_start"] <= p["period_end"]
+            assert 0.0 <= p["confidence"] <= 1.0
+
+    def test_shorter_period_uses_fewer_visits_and_lower_threshold(self, movement_analysis):
+        short = engine.get_movement_analysis(BBOX, AOI_ID, "2026-04-01", "2026-09-01")
+        assert short["n_acquisitions"] < movement_analysis["n_acquisitions"]
+        assert short["period"]["days"] < movement_analysis["period"]["days"]
+        assert short["threshold_mm"] < movement_analysis["threshold_mm"]
+        # Cumulative movement grows with the length of the period
+        assert (short["stats"]["max_movement_magnitude_mm"]
+                <= movement_analysis["stats"]["max_movement_magnitude_mm"])
+
+    def test_error_paths(self):
+        with pytest.raises(ValueError):
+            engine.get_movement_analysis(BBOX, AOI_ID, "2026-09-01", "2026-09-01")
+        with pytest.raises(ValueError):
+            engine.get_movement_analysis(BBOX, AOI_ID, "2026-06-01", "2026-01-01")
+
+    def test_area_ids_do_not_leak_between_aois(self):
+        f1 = engine.get_movement_analysis(BBOX, "alpha")["areas"]["features"]
+        f2 = engine.get_movement_analysis(BBOX, "beta")["areas"]["features"]
+        ids1 = {f["properties"]["id"] for f in f1}
+        ids2 = {f["properties"]["id"] for f in f2}
+        assert ids1.isdisjoint(ids2)
+
+
+# ---------------------------------------------------------------------------
+# Movement heatmap PNG
+# ---------------------------------------------------------------------------
+
+def _decode_rgba(data: bytes):
+    """Decode an engine-produced RGBA PNG into (width, height, rows)."""
+    chunks = dict(_parse_png_chunks(data))
+    width, height = struct.unpack(">II", chunks[b"IHDR"][:8])
+    raw = zlib.decompress(chunks[b"IDAT"])
+    stride = width * 4 + 1
+    rows = [raw[i * stride + 1:(i + 1) * stride] for i in range(height)]
+    return width, height, rows
+
+
+class TestMovementPng:
+    def test_valid_rgba_png(self):
+        png = engine.get_movement_image(BBOX, AOI_ID, "2026-01-01", "2026-06-01")
+        width, height, rows = _decode_rgba(png)
+        assert (width, height) == (engine.GRID_W, engine.GRID_H)
+        assert len(rows) == engine.GRID_H
+        chunks = _parse_png_chunks(png)
+        assert chunks[0][0] == b"IHDR"
+        assert chunks[-1][0] == b"IEND"
+
+    def test_ramp_extremes(self):
+        # Flat terrain stays transparent
+        assert engine.movement_to_rgba(0.0)[3] == 0
+        assert engine.movement_to_rgba(0.5)[3] == 0
+        # Strong movement renders in the magenta family with high alpha
+        r, g, b, a = engine.movement_to_rgba(25.0)
+        assert a > 200
+        assert r == 255 and g > 150
+
+    def test_alpha_grows_with_magnitude(self):
+        alphas = [engine.movement_to_rgba(m)[3] for m in (2.0, 6.0, 12.0, 25.0)]
+        assert alphas == sorted(alphas)
+
+    def test_coherence_damps_alpha(self):
+        movement = [[20.0] * engine.GRID_W for _ in range(engine.GRID_H)]
+        confident = engine.render_movement_png(movement, [[0.95] * engine.GRID_W for _ in range(engine.GRID_H)])
+        decorrelated = engine.render_movement_png(movement, [[0.10] * engine.GRID_W for _ in range(engine.GRID_H)])
+        _, _, rows_strong = _decode_rgba(confident)
+        _, _, rows_weak = _decode_rgba(decorrelated)
+        assert rows_strong[0][3] > rows_weak[0][3] > 0
