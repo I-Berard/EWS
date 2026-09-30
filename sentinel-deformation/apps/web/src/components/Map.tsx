@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import type { AnomalyCollection, ImageKind, ProductMeta, Polygon } from '../api';
+import type { AnomalyCollection, ImageKind, MovementAnalysis, MovementAreaProperties, ProductMeta, Polygon } from '../api';
 
 interface MapProps {
   aoi?: { id: string; geometry: Polygon } | null;
@@ -11,8 +11,16 @@ interface MapProps {
   visibleImages?: Record<ImageKind, boolean>;
   /** Focus this anomaly (rank list selection) - highlights it and flies to it. */
   selectedAnomalyId?: string | null;
+  /** URL of the period-movement heatmap PNG (stack of Sentinel-1 visits). */
+  movementUrl?: string | null;
+  /** Ranked areas that moved the most inside the selected period. */
+  movementAreas?: MovementAnalysis | null;
+  /** Focus this movement area (rank list selection) - highlights it and flies to it. */
+  selectedMovementId?: string | null;
   onMapClick?: (lngLat: { lat: number; lng: number }) => void;
   onAnomalyClick?: (anomalyProperties: AnomalyCollection['features'][0]['properties']) => void;
+  onMovementAreaClick?: (properties: MovementAreaProperties) => void;
+  onBoundsChange?: (bounds: [number, number, number, number]) => void;
 }
 
 // Magnitude colour ramp for |mean_velocity| (mm/yr) - matches the API's PNG ramp
@@ -35,14 +43,43 @@ const velocityColorExpression = (): maplibregl.ExpressionSpecification => {
   ] as unknown as maplibregl.ExpressionSpecification;
 };
 
+// Magnitude colour ramp for cumulative |movement| (mm over the period) - matches
+// the API's MOVEMENT_RAMP used for the heatmap PNG.
+const MOVEMENT_RAMP: Array<[number, string]> = [
+  [1, '#966eff'],
+  [4, '#cd3ceb'],
+  [10, '#ff2da5'],
+  [18, '#ff8c3c'],
+  [28, '#ffeb8c'],
+];
+
+/** MapLibre expression interpolating fill color by |peak_movement_mm|. */
+const movementColorExpression = (): maplibregl.ExpressionSpecification => {
+  const stops = MOVEMENT_RAMP.flatMap(([threshold, color]) => [threshold, color]);
+  return [
+    'interpolate',
+    ['linear'],
+    ['abs', ['coalesce', ['get', 'peak_movement_mm'], 0]],
+    ...stops,
+  ] as unknown as maplibregl.ExpressionSpecification;
+};
+
+/** Filter shape accepted by Map#setFilter (kept opaque to the local typings). */
+type MapFilter = Parameters<maplibregl.Map['setFilter']>[1];
+
 const MapComponent: React.FC<MapProps> = ({
   aoi,
   anomalies,
   product,
   visibleImages,
   selectedAnomalyId,
+  movementUrl,
+  movementAreas,
+  selectedMovementId,
   onMapClick,
   onAnomalyClick,
+  onMovementAreaClick,
+  onBoundsChange,
 }) => {
   const mapContainer = useRef<HTMLDivElement>(null);
   const map = useRef<maplibregl.Map | null>(null);
@@ -51,8 +88,10 @@ const MapComponent: React.FC<MapProps> = ({
   // Keep latest callbacks without re-binding map events
   const clickCb = useRef(onMapClick);
   const anomalyCb = useRef(onAnomalyClick);
+  const movementCb = useRef(onMovementAreaClick);
   clickCb.current = onMapClick;
   anomalyCb.current = onAnomalyClick;
+  movementCb.current = onMovementAreaClick;
 
   const runWhenReady = (fn: () => void) => {
     if (map.current && mapReady.current) {
@@ -79,9 +118,28 @@ const MapComponent: React.FC<MapProps> = ({
     map.current.on('load', () => {
       mapReady.current = true;
       map.current?.triggerRepaint();
+      if (map.current && onBoundsChange) {
+        const b = map.current.getBounds();
+        onBoundsChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
+      }
+    });
+
+    map.current.on('moveend', () => {
+      if (map.current && onBoundsChange) {
+        const b = map.current.getBounds();
+        onBoundsChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
+      }
     });
 
     map.current.on('click', (e) => {
+      // Movement areas render on top - query them before the anomalies
+      if (map.current?.getLayer('movement-areas-fill')) {
+        const movementFeatures = map.current.queryRenderedFeatures(e.point, { layers: ['movement-areas-fill'] });
+        if (movementFeatures && movementFeatures.length > 0 && movementCb.current) {
+          movementCb.current(movementFeatures[0].properties as MovementAreaProperties);
+          return;
+        }
+      }
       const anomalyFeatures = map.current?.queryRenderedFeatures(e.point, { layers: ['anomalies-fill'] });
       if (anomalyFeatures && anomalyFeatures.length > 0 && anomalyCb.current) {
         anomalyCb.current(anomalyFeatures[0].properties as AnomalyCollection['features'][0]['properties']);
@@ -94,6 +152,12 @@ const MapComponent: React.FC<MapProps> = ({
       if (map.current) map.current.getCanvas().style.cursor = 'pointer';
     });
     map.current.on('mouseleave', 'anomalies-fill', () => {
+      if (map.current) map.current.getCanvas().style.cursor = '';
+    });
+    map.current.on('mouseenter', 'movement-areas-fill', () => {
+      if (map.current) map.current.getCanvas().style.cursor = 'pointer';
+    });
+    map.current.on('mouseleave', 'movement-areas-fill', () => {
       if (map.current) map.current.getCanvas().style.cursor = '';
     });
   }, []);
@@ -154,12 +218,63 @@ const MapComponent: React.FC<MapProps> = ({
       const visible = visibleImages?.[id] ?? false;
       map.current.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
     }
+    // The movement heatmap and its ranked polygons toggle together
+    const movementVisible = (visibleImages?.movement ?? false) && !!movementUrl;
+    for (const layerId of ['overlay-movement', 'movement-areas-fill', 'movement-areas-outline']) {
+      if (!map.current.getLayer(layerId)) continue;
+      map.current.setLayoutProperty(layerId, 'visibility', movementVisible ? 'visible' : 'none');
+    }
   };
 
   useEffect(() => {
     runWhenReady(updateImageVisibility);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visibleImages, product]);
+  }, [visibleImages, product, movementUrl]);
+
+  // -------------------------------------------------------------------------
+  // Period-movement heatmap raster (API-rendered stack of Sentinel-1 visits)
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (!map.current || !product || !movementUrl) return;
+
+    runWhenReady(() => {
+      if (!map.current || !product || !movementUrl) return;
+      const [west, south, east, north] = product.bbox;
+      const coordinates: [[number, number], [number, number], [number, number], [number, number]] = [
+        [west, north],
+        [east, north],
+        [east, south],
+        [west, south],
+      ];
+      const existing = map.current.getSource('img-movement') as unknown as
+        | { updateImage?: (opts: { url: string; coordinates?: typeof coordinates }) => void }
+        | undefined;
+
+      if (!existing) {
+        map.current.addSource('img-movement', { type: 'image', url: movementUrl, coordinates });
+      } else if (typeof existing.updateImage === 'function') {
+        // Same source: swap URL (new period) and coordinates (new AOI) in place
+        existing.updateImage({ url: movementUrl, coordinates });
+      }
+
+      if (!map.current.getLayer('overlay-movement')) {
+        map.current.addLayer(
+          {
+            id: 'overlay-movement',
+            type: 'raster',
+            source: 'img-movement',
+            paint: {
+              'raster-opacity': 0.9,
+              'raster-fade-duration': 300,
+            },
+          },
+          map.current.getLayer('anomalies-fill') ? 'anomalies-fill' : undefined,
+        );
+      }
+      updateImageVisibility();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [product, movementUrl]);
 
   // -------------------------------------------------------------------------
   // AOI outline + fit bounds
@@ -265,6 +380,47 @@ const MapComponent: React.FC<MapProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [anomalies]);
 
+  // -------------------------------------------------------------------------
+  // Movement areas: ranked polygons for the selected period
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (!map.current || !movementAreas) return;
+
+    runWhenReady(() => {
+      if (!map.current || !movementAreas) return;
+      const data = movementAreas.areas;
+      const existing = map.current.getSource('movement-areas') as maplibregl.GeoJSONSource | undefined;
+
+      if (existing) {
+        existing.setData(data);
+      } else {
+        map.current.addSource('movement-areas', { type: 'geojson', data });
+        map.current.addLayer({
+          id: 'movement-areas-fill',
+          type: 'fill',
+          source: 'movement-areas',
+          paint: {
+            'fill-color': movementColorExpression(),
+            'fill-opacity': 0.5,
+          },
+        });
+        map.current.addLayer({
+          id: 'movement-areas-outline',
+          type: 'line',
+          source: 'movement-areas',
+          paint: {
+            'line-color': '#ff2da5',
+            'line-width': ['case', ['==', ['get', 'rank'], 1], 3, 1.5],
+          },
+        });
+      }
+
+      updateMovementSelection();
+      updateImageVisibility();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [movementAreas]);
+
   // Highlight the selected anomaly (from the ranked list or a map click)
   const updateSelection = () => {
     if (!map.current) return;
@@ -290,6 +446,28 @@ const MapComponent: React.FC<MapProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedAnomalyId, anomalies]);
 
+  // Highlight the selected movement area (from the ranked list or a map click)
+  const updateMovementSelection = () => {
+    if (!map.current) return;
+    const selectedId = selectedMovementId ?? null;
+    if (map.current.getLayer('movement-areas-outline')) {
+      map.current.setFilter(
+        'movement-areas-outline',
+        (selectedId
+          ? ['==', ['get', 'id'], selectedId]
+          : ['==', ['get', 'rank'], 1]) as unknown as MapFilter,
+      );
+    }
+    if (map.current.getLayer('movement-areas-fill')) {
+      map.current.setPaintProperty('movement-areas-fill', 'fill-opacity', selectedId ? 0.75 : 0.5);
+    }
+  };
+
+  useEffect(() => {
+    runWhenReady(updateMovementSelection);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedMovementId, movementAreas]);
+
   // Fly to the selected anomaly when chosen from the ranked list
   useEffect(() => {
     if (!map.current || !selectedAnomalyId || !anomalies) return;
@@ -306,6 +484,23 @@ const MapComponent: React.FC<MapProps> = ({
       { padding: 120, duration: 900, maxZoom: 14 },
     );
   }, [selectedAnomalyId, anomalies]);
+
+  // Fly to the selected movement area when chosen from the ranked list
+  useEffect(() => {
+    if (!map.current || !selectedMovementId || !movementAreas) return;
+    const feature = movementAreas.areas.features.find((f) => f.properties.id === selectedMovementId);
+    if (!feature) return;
+    const coords: Array<[number, number]> = feature.geometry.coordinates[0];
+    const lons = coords.map((c) => c[0]);
+    const lats = coords.map((c) => c[1]);
+    map.current.fitBounds(
+      [
+        [Math.min(...lons), Math.min(...lats)],
+        [Math.max(...lons), Math.max(...lats)],
+      ],
+      { padding: 120, duration: 900, maxZoom: 14 },
+    );
+  }, [selectedMovementId, movementAreas]);
 
   return <div ref={mapContainer} className="map-container" style={{ width: '100%', height: '100%' }} />;
 };
