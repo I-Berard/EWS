@@ -8,6 +8,9 @@ A web platform that automatically downloads and processes Sentinel-1 SAR data to
 * Store InSAR products in PostgreSQL & MinIO
 * Interactive MapLibre GL map
 * Displacement time series charts
+* Period movement analysis: overlays the stack of Sentinel-1 visits taken in a
+  selected date range, estimates per-pixel movement, and highlights the areas
+  that moved the most in that period (magenta heatmap + ranked hotspots)
 
 ## Architecture
 - **Frontend**: React, TypeScript, Vite, MapLibre GL, Recharts, TanStack Query
