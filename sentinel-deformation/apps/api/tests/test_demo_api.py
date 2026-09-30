@@ -138,3 +138,136 @@ class TestImageServing:
     def test_image_missing_aoi(self):
         res = client.get(f"/api/demo/aois/{MISSING}/images/sar")
         assert res.status_code == 404
+
+
+class TestAcquisitions:
+    def test_visit_schedule(self):
+        res = client.get(f"/api/demo/aois/{AOI}/acquisitions")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["aoi_id"] == AOI
+        assert body["cycle_days"] == 12
+        acq = body["acquisitions"]
+        assert len(acq) >= 10
+        dates = [a["date"] for a in acq]
+        assert dates == sorted(dates)
+        assert [a["index"] for a in acq] == list(range(len(acq)))
+
+    def test_acquisitions_missing_aoi(self):
+        res = client.get(f"/api/demo/aois/{MISSING}/acquisitions")
+        assert res.status_code == 404
+
+
+class TestMovement:
+    def test_full_mission_default_period(self):
+        res = client.get(f"/api/demo/aois/{AOI}/movement")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["aoi_id"] == AOI
+        assert body["n_acquisitions"] >= 2
+        assert body["n_acquisitions"] == len(body["acquisitions"])
+        assert body["period"]["start"] <= body["period"]["end"]
+        assert body["unit"] == "mm (LOS)"
+        assert body["threshold_mm"] > 0
+        assert "max_movement_magnitude_mm" in body["stats"]
+
+    def test_explicit_period(self):
+        full = client.get(f"/api/demo/aois/{AOI}/movement").json()
+        res = client.get(
+            f"/api/demo/aois/{AOI}/movement",
+            params={"start": "2026-03-01", "end": "2026-09-01"},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["period"]["start"] == "2026-03-01"
+        assert body["period"]["end"] == "2026-09-01"
+        assert body["n_acquisitions"] < full["n_acquisitions"]
+        for acq in body["acquisitions"]:
+            assert "2026-03-01" <= acq["date"] <= "2026-09-01"
+
+    def test_areas_are_ranked_feature_collection(self):
+        body = client.get(f"/api/demo/aois/{AOI}/movement").json()
+        areas = body["areas"]
+        assert areas["type"] == "FeatureCollection"
+        features = areas["features"]
+        peaks = [abs(f["properties"]["peak_movement_mm"]) for f in features]
+        assert peaks == sorted(peaks, reverse=True)
+        assert [f["properties"]["rank"] for f in features] == list(range(1, len(features) + 1))
+        assert body["stats"]["n_areas"] == len(features)
+
+    def test_movement_missing_aoi(self):
+        res = client.get(f"/api/demo/aois/{MISSING}/movement")
+        assert res.status_code == 404
+
+    def test_period_without_enough_visits_422(self):
+        res = client.get(
+            f"/api/demo/aois/{AOI}/movement",
+            params={"start": "2026-09-01", "end": "2026-09-02"},
+        )
+        assert res.status_code == 422
+        assert "visit" in res.json()["detail"]
+
+    def test_inverted_period_422(self):
+        res = client.get(
+            f"/api/demo/aois/{AOI}/movement",
+            params={"start": "2026-09-01", "end": "2026-01-01"},
+        )
+        assert res.status_code == 422
+
+    def test_malformed_date_422(self):
+        res = client.get(
+            f"/api/demo/aois/{AOI}/movement",
+            params={"start": "not-a-date", "end": "2026-01-01"},
+        )
+        assert res.status_code == 422
+
+
+class TestMovementImage:
+    def test_movement_image_is_png(self):
+        res = client.get(
+            f"/api/demo/aois/{AOI}/images/movement",
+            params={"start": "2026-01-01", "end": "2026-09-01"},
+        )
+        assert res.status_code == 200
+        assert res.headers["content-type"] == "image/png"
+        assert "max-age" in res.headers.get("cache-control", "")
+        assert res.content[:8] == b"\x89PNG\r\n\x1a\n"
+        width, height = struct.unpack(">II", res.content[16:24])
+        from app import demo_engine
+        assert (width, height) == (demo_engine.GRID_W, demo_engine.GRID_H)
+
+    def test_movement_image_bad_period_422(self):
+        res = client.get(
+            f"/api/demo/aois/{AOI}/images/movement",
+            params={"start": "2026-09-01", "end": "2026-09-02"},
+        )
+        assert res.status_code == 422
+
+    def test_movement_image_missing_aoi(self):
+        res = client.get(f"/api/demo/aois/{MISSING}/images/movement")
+        assert res.status_code == 404
+
+
+class TestVisitImage:
+    @pytest.mark.parametrize("index", [0, 17, 35])
+    def test_visit_image_is_png(self, index):
+        res = client.get(f"/api/demo/aois/{AOI}/images/visit/{index}")
+        assert res.status_code == 200
+        assert res.headers["content-type"] == "image/png"
+        assert res.content[:8] == b"\x89PNG\r\n\x1a\n"
+        width, height = struct.unpack(">II", res.content[16:24])
+        from app import demo_engine
+        assert (width, height) == (demo_engine.GRID_W, demo_engine.GRID_H)
+
+    def test_visits_differ_from_each_other(self):
+        first = client.get(f"/api/demo/aois/{AOI}/images/visit/0").content
+        later = client.get(f"/api/demo/aois/{AOI}/images/visit/1").content
+        assert first != later  # separate speckle realisations per visit
+
+    def test_visit_index_out_of_range_404(self):
+        assert client.get(f"/api/demo/aois/{AOI}/images/visit/999").status_code == 404
+        assert client.get(f"/api/demo/aois/{AOI}/images/visit/-1").status_code == 404
+
+    def test_visit_image_missing_aoi(self):
+        res = client.get(f"/api/demo/aois/{MISSING}/images/visit/0")
+        assert res.status_code == 404
