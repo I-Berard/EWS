@@ -231,3 +231,81 @@ export function getRealTimeline(aoiId: string, bbox?: [number, number, number, n
   }
   return getJson(url)
 }
+
+// ---------------------------------------------------------------------------
+// Real Sentinel data types & API
+// ---------------------------------------------------------------------------
+
+export interface RealAnalyseRequest {
+  bbox: [number, number, number, number]   // [west, south, east, north]
+  baseline_start: string                   // YYYY-MM-DD
+  baseline_end: string
+  monitoring_start: string
+  monitoring_end: string
+  zscore_threshold?: number
+  aoi_id?: string
+}
+
+export interface RealAnomalyProperties {
+  id: string
+  aoi_id: string
+  event_type: 'backscatter_decrease' | 'backscatter_increase' | string
+  area_m2: number
+  mean_change_db: number
+  peak_change_db: number
+  baseline_vv_db: number
+  monitoring_vv_db: number
+  confidence: number
+  pixel_count: number
+  rank: number
+  detected_at: string
+}
+
+export interface RealAnomalyFeature {
+  type: 'Feature'
+  properties: RealAnomalyProperties
+  geometry: Polygon
+}
+
+export interface RealStats {
+  mean_change_db: number
+  std_change_db: number
+  peak_change_db: number
+  total_change_pixels: number
+  total_change_area_m2: number
+  n_anomalies: number
+  zscore_threshold: number
+}
+
+export interface RealAnalysisResult {
+  aoi_id: string
+  satellite: string
+  bbox: [number, number, number, number]
+  baseline: { start: string; end: string }
+  monitoring: { start: string; end: string }
+  stats: RealStats
+  anomalies: { type: 'FeatureCollection'; features: RealAnomalyFeature[] }
+  images: {
+    sar_baseline: string    // base64 PNG
+    sar_monitoring: string  // base64 PNG
+    change_overlay: string  // base64 PNG
+    sentinel2_rgb: string   // base64 PNG (may be empty)
+  }
+  generated_at: string
+  cached: boolean
+}
+
+const REAL_BASE = '/api/real'
+
+export async function runRealAnalysis(req: RealAnalyseRequest): Promise<RealAnalysisResult> {
+  const res = await fetch(`${REAL_BASE}/analyse`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(detail.detail || `Analysis failed: ${res.status}`)
+  }
+  return res.json()
+}
