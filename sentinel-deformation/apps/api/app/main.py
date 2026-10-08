@@ -1,12 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .api import aoi, demo
+from .api import aoi, demo, real
 
 app = FastAPI(
     title="Sentinel Deformation Monitor",
     description="API for managing Sentinel-1 InSAR processing and deformation monitoring",
-    version="0.1.0"
+    version="0.2.0"
 )
 
 app.add_middleware(
@@ -27,8 +27,9 @@ def root():
     return {
         "name": "Sentinel Deformation Monitor API",
         "docs": "/docs",
-        "endpoints": ["/health", "/api/aois", "/api/demo/aois"],
+        "endpoints": ["/health", "/api/aois", "/api/demo/aois", "/api/real/analyse"],
     }
 
 app.include_router(aoi.router, prefix="/api/aois", tags=["aois"])
 app.include_router(demo.router, prefix="/api/demo", tags=["demo"])
+app.include_router(real.router, prefix="/api/real", tags=["real"])
