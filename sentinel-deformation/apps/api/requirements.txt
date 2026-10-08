@@ -14,3 +14,7 @@ geopandas
 shapely
 scipy
 numpy
+tifffile
+oauthlib
+requests-oauthlib
+python-dotenv
