@@ -1,0 +1,13 @@
+# Default project configuration
+project_name: Sentinel-1 InSAR Anomaly Platform
+
+study_area:
+
+  name: Demo Region
+  bbox: [-122.5, 37.5, -122.0, 38.0] # [minx, miny, maxx, maxy] in WGS84
+
+anomaly_detection:
+  min_valid_observations: 20
+  velocity_threshold_mm_yr: 10.0
+  residual_z_score_threshold: 3.0
+  min_cluster_size_pixels: 5
