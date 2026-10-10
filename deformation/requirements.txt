@@ -1,0 +1,17 @@
+streamlit
+plotly
+numpy
+scipy
+pandas
+h5py
+scikit-learn
+ruptures
+statsmodels
+rasterio
+geopandas
+shapely
+pyproj
+matplotlib
+pytest
+pyyaml
+requests
